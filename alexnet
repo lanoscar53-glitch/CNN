@@ -1,0 +1,104 @@
+# -*- coding: utf-8 -*-
+"""
+AlexNet 训练 CIFAR-10（精简版：自动识别 GPU/CPU，含 torch.compile 加速）
+数据集：本地 D 盘 或 服务器自动下载（修改 root 与 download 即可）
+运行：python alexnet_cifar10.py
+"""
+
+import time                                                                                                                                                                                                                                                                                                             
+import torch
+from torch import nn
+from torch.utils import data
+import torchvision
+from torchvision import transforms
+
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')   # 有GPU用GPU，否则CPU
+
+# ---------- 1. 数据加载（仅保留加载与格式转换） ----------
+class LocalCIFAR10(torchvision.datasets.CIFAR10):
+    """跳过官方 MD5 校验（本地转储文件字节与官方不同，数据内容一致），只查文件是否存在"""
+    def _check_integrity(self):
+        import os
+        return all(os.path.isfile(os.path.join(self.root, self.base_folder, f))
+                   for f, _ in (self.train_list + self.test_list))
+
+    def _load_meta(self):
+        import os, pickle
+        with open(os.path.join(self.root, self.base_folder, self.meta["filename"]), "rb") as f:
+            self.classes = pickle.load(f, encoding="latin1")[self.meta["key"]]
+
+trans = transforms.Compose([
+    transforms.ToTensor(),    # HWC->CHW，像素 [0,255]->[0,1]
+    transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2470, 0.2435, 0.2616)),  # 按数据集均值/方差标准化，加速收敛
+])
+# 本地数据：root=r"D:\datasets\cifar10", download=False
+# 云服务器：root="./data", download=True（服务器带宽快，秒下）
+train_set = LocalCIFAR10(root=r"D:\datasets\cifar10", train=True, transform=trans, download=False)   # 50000 张
+test_set = LocalCIFAR10(root=r"D:\datasets\cifar10", train=False, transform=trans, download=False)   # 10000 张
+batch_size = 512
+train_iter = data.DataLoader(train_set, batch_size, shuffle=True,
+                             pin_memory=device.type == 'cuda')    # GPU 训练时加速主机到显存拷贝
+test_iter = data.DataLoader(test_set, batch_size, shuffle=False,
+                            pin_memory=device.type == 'cuda')
+
+# ---------- 2. 模型搭建（AlexNet 适配 CIFAR-10 的 32x32 输入版） ----------
+# 3x32x32 -> 64x16x16 -> 192x8x8 -> 384x8x8 -> 256x8x8 -> 256x4x4，展平后 256*4*4=4096
+net = nn.Sequential(
+    nn.Conv2d(3, 64, kernel_size=3, padding=1), nn.ReLU(),                 # 3->64,   32x32
+    nn.MaxPool2d(kernel_size=2, stride=2),                                  # 64,      16x16
+    nn.Conv2d(64, 192, kernel_size=3, padding=1), nn.ReLU(),                # 64->192, 16x16
+    nn.MaxPool2d(kernel_size=2, stride=2),                                  # 192,     8x8
+    nn.Conv2d(192, 384, kernel_size=3, padding=1), nn.ReLU(),               # 192->384, 8x8
+    nn.Conv2d(384, 256, kernel_size=3, padding=1), nn.ReLU(),               # 384->256, 8x8
+    nn.Conv2d(256, 256, kernel_size=3, padding=1), nn.ReLU(),               # 256->256, 8x8
+    nn.MaxPool2d(kernel_size=2, stride=2),                                  # 256,     4x4
+    nn.Flatten(),                                                           # 展平成 4096 维
+    nn.Linear(4096, 4096), nn.ReLU(), nn.Dropout(p=0.5),                   # 全连接 + Dropout 防过拟合
+    nn.Linear(4096, 4096), nn.ReLU(), nn.Dropout(p=0.5),
+    nn.Linear(4096, 10))                                                    # 输出: 4096->10 类
+
+for m in net:                          # Xavier 初始化（深网络按每层维度定制方差）
+    if isinstance(m, (nn.Linear, nn.Conv2d)):
+        nn.init.xavier_uniform_(m.weight)
+
+net = net.to(device)                   # 模型放到 GPU/CPU
+try:                                   # torch.compile 编译加速（首次编译 1-2 分钟，之后提速 20%-50%）
+    net = torch.compile(net)
+except Exception:
+    pass
+
+# ---------- 3. 训练 + 评估（训练循环中直接统计，epoch 末在测试集上评估） ----------
+lr, num_epochs = 0.01, 20
+optimizer = torch.optim.SGD(net.parameters(), lr=lr, momentum=0.9)
+loss = nn.CrossEntropyLoss()
+
+print(f'training on {device}，首次迭代会触发编译，请耐心等待...')
+for epoch in range(num_epochs):
+    net.train()
+    total_loss, correct, total = 0.0, 0, 0
+    t0 = time.time()
+    for X, y in train_iter:
+        X, y = X.to(device), y.to(device)      # 数据放到 GPU/CPU
+        optimizer.zero_grad()
+        y_hat = net(X)
+        l = loss(y_hat, y)
+        l.backward()
+        optimizer.step()
+        with torch.no_grad():
+            total_loss += l * X.shape[0]
+            correct += (y_hat.argmax(1) == y).sum().item()
+            total += X.shape[0]
+
+    net.eval()
+    test_correct, test_total = 0, 0
+    with torch.no_grad():
+        for X, y in test_iter:
+            X, y = X.to(device), y.to(device)
+            test_correct += (net(X).argmax(1) == y).sum().item()
+            test_total += y.numel()
+
+    print(f'epoch {epoch+1}/{num_epochs}: '
+          f'train loss {total_loss/total:.3f}, '
+          f'train acc {correct/total:.3f}, '
+          f'test acc {test_correct/test_total:.3f}, '
+          f'{total/(time.time()-t0):.0f} img/s')
